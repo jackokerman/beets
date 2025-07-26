@@ -76,6 +76,16 @@ TRACK_INDEX_RE = re.compile(
     re.VERBOSE,
 )
 
+# Mapping from beets field names to Discogs API search parameters
+FIELDS_TO_DISCOGS_KEYS = {
+    "catalognum": "catno",
+    "country": "country",
+    "label": "label",
+    "barcode": "barcode",
+    "media": "format",
+    "year": "year",
+}
+
 
 class ReleaseFormat(TypedDict):
     name: str
@@ -97,6 +107,7 @@ class DiscogsPlugin(MetadataSourcePlugin):
                 "index_tracks": False,
                 "append_style_genre": False,
                 "search_limit": 5,
+                "extra_tags": [],
             }
         )
         self.config["apikey"].redact = True
@@ -171,7 +182,25 @@ class DiscogsPlugin(MetadataSourcePlugin):
     def candidates(
         self, items: Sequence[Item], artist: str, album: str, va_likely: bool
     ) -> Iterable[AlbumInfo]:
-        return self.get_albums(f"{artist} {album}" if va_likely else album)
+        # Build Discogs search kwargs from extra_tags
+        extra_tags = self.config["extra_tags"].as_str_seq()
+        search_kwargs = {}
+        if items and extra_tags:
+            item = items[0]
+            for tag in extra_tags:
+                discogs_key = FIELDS_TO_DISCOGS_KEYS.get(tag)
+                value = getattr(item, tag, None)
+                if discogs_key and value:
+                    search_kwargs[discogs_key] = value
+                elif tag == "albumdisambig":
+                    # No direct mapping; append to album string if present
+                    albumdisambig = getattr(item, tag, None)
+                    if albumdisambig:
+                        album = f"{album} {albumdisambig}"
+
+        # Compose query string as before
+        query = f"{artist} {album}" if va_likely else album
+        return self.get_albums(query, **search_kwargs)
 
     def get_track_from_album(
         self, album_info: AlbumInfo, compare: Callable[[TrackInfo], float]
@@ -237,7 +266,7 @@ class DiscogsPlugin(MetadataSourcePlugin):
 
         return None
 
-    def get_albums(self, query: str) -> Iterable[AlbumInfo]:
+    def get_albums(self, query: str, **kwargs) -> Iterable[AlbumInfo]:
         """Returns a list of AlbumInfo objects for a discogs search query."""
         # Strip non-word characters from query. Things like "!" and "-" can
         # cause a query to return no results, even if they match the artist or
@@ -249,7 +278,7 @@ class DiscogsPlugin(MetadataSourcePlugin):
         query = re.sub(r"(?i)\b(CD|disc|vinyl)\s*\d+", "", query)
 
         try:
-            results = self.discogs_client.search(query, type="release")
+            results = self.discogs_client.search(query, type="release", **kwargs)
             results.per_page = self.config["search_limit"].as_number()
             releases = results.page(1)
         except CONNECTION_ERRORS:
