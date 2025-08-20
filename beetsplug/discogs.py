@@ -108,6 +108,7 @@ class DiscogsPlugin(MetadataSourcePlugin):
                 "append_style_genre": False,
                 "search_limit": 5,
                 "extra_tags": [],
+                "filter_special_chars": True,  # Control special character filtering
             }
         )
         self.config["apikey"].redact = True
@@ -179,12 +180,17 @@ class DiscogsPlugin(MetadataSourcePlugin):
 
         return token, secret
 
-    def candidates(
-        self, items: Sequence[Item], artist: str, album: str, va_likely: bool
-    ) -> Iterable[AlbumInfo]:
-        # Build Discogs search kwargs from extra_tags
+    def build_search_kwargs_from_extra_tags(
+        self, items: Sequence[Item]
+    ) -> dict:
+        """Build search parameters from extra_tags configuration.
+
+        :param items: List of items in the album
+        :return: Dictionary of search parameters for Discogs API
+        """
         extra_tags = self.config["extra_tags"].as_str_seq()
         search_kwargs = {}
+
         if items and extra_tags:
             item = items[0]
             for tag in extra_tags:
@@ -192,15 +198,115 @@ class DiscogsPlugin(MetadataSourcePlugin):
                 value = getattr(item, tag, None)
                 if discogs_key and value:
                     search_kwargs[discogs_key] = value
-                elif tag == "albumdisambig":
-                    # No direct mapping; append to album string if present
-                    albumdisambig = getattr(item, tag, None)
-                    if albumdisambig:
-                        album = f"{album} {albumdisambig}"
+                elif tag == "albumdisambig" and value:
+                    # Store albumdisambig for later use in album modification
+                    search_kwargs["albumdisambig"] = value
 
-        # Compose query string as before
-        query = f"{artist} {album}" if va_likely else album
-        return self.get_albums(query, **search_kwargs)
+        return search_kwargs
+
+    def candidates(
+        self, items: Sequence[Item], artist: str, album: str, va_likely: bool
+    ) -> Iterable[AlbumInfo]:
+        """Return :py:class:`AlbumInfo` candidates that match the given album.
+
+        Uses multiple search approaches to cast a wide net for potential matches,
+        including direct ID lookups, targeted searches with metadata, and fallback
+        strategies. The goal is to provide beets with a comprehensive set of
+        candidates for its matching algorithm to evaluate.
+
+        :param items: List of items in the album
+        :param artist: Album artist name
+        :param album: Album name
+        :param va_likely: Whether the album is likely to be by various artists
+        :return: Iterable of AlbumInfo candidates
+        """
+        candidates = []
+
+        # Direct ID lookup from originquery plugin
+        candidates.extend(self.get_candidates_from_url(items))
+
+        # Build search kwargs from extra_tags
+        search_kwargs = self.build_search_kwargs_from_extra_tags(items)
+
+        # Handle albumdisambig modification if present
+        albumdisambig = search_kwargs.pop("albumdisambig", None)
+        if albumdisambig:
+            album = f"{album} {albumdisambig}"
+
+        # For VA releases, prioritize album-only search
+        if va_likely:
+            candidates.extend(self.get_albums(album, **search_kwargs))
+
+        # Search with artist, album, and extra tags
+        search_query = f"{artist} {album}"
+        candidates.extend(self.get_albums(search_query, **search_kwargs))
+
+        # Search with just album, no extra tags
+        if not candidates:
+            candidates.extend(self.get_albums(album))
+
+        return candidates
+
+    def get_candidates_from_url(self, items: Sequence[Item]) -> list[AlbumInfo]:
+        """Extract candidates from Discogs URL found in metadata.
+
+        :param items: List of items in the album
+        :return: List of AlbumInfo candidates from URL
+        """
+        candidates = []
+
+        # Read Discogs URL from extra_tags
+        discogs_url = None
+        if items:
+            discogs_url = getattr(items[0], "metadata_urls_discogs", None)
+
+        if not discogs_url:
+            return candidates
+
+        self._log.debug("Found Discogs URL in metadata: %s", discogs_url)
+
+        # Use beets' built-in ID extraction
+        from beets.util.id_extractors import extract_release_id
+
+        # Check if this is a master release URL
+        if "/master/" in discogs_url:
+            # Extract master ID and get all versions
+            master_match = re.search(r"/master/(\d+)", discogs_url)
+            if master_match:
+                master_id = master_match.group(1)
+                self._log.debug("Found master release ID: %s", master_id)
+                # Use the much more efficient master_id search parameter
+                master_candidates = self.get_albums("", master_id=master_id)
+                candidates.extend(master_candidates)
+                self._log.debug(
+                    "Added %d candidates from master %s using efficient search",
+                    len(list(master_candidates)),
+                    master_id,
+                )
+        else:
+            # Standard release URL - try direct lookup
+            release_id = extract_release_id("discogs", discogs_url)
+
+            if release_id:
+                self._log.debug("Extracted Discogs release ID: %s", release_id)
+                direct_result = self.album_for_id(release_id)
+                if direct_result:
+                    candidates.append(direct_result)
+                    self._log.debug(
+                        "Direct Discogs lookup successful, added to candidates"
+                    )
+                else:
+                    self._log.debug(
+                        "Direct Discogs lookup failed for ID: %s",
+                        release_id,
+                    )
+            else:
+                self._log.debug(
+                    "Could not extract Discogs release ID from URL: %s",
+                    discogs_url,
+                )
+
+        return candidates
 
     def get_track_from_album(
         self, album_info: AlbumInfo, compare: Callable[[TrackInfo], float]
@@ -268,19 +374,35 @@ class DiscogsPlugin(MetadataSourcePlugin):
 
     def get_albums(self, query: str, **kwargs) -> Iterable[AlbumInfo]:
         """Returns a list of AlbumInfo objects for a discogs search query."""
-        # Strip non-word characters from query. Things like "!" and "-" can
-        # cause a query to return no results, even if they match the artist or
-        # album title. Use `re.UNICODE` flag to avoid stripping non-english
-        # word characters.
-        query = re.sub(r"(?u)\W+", " ", query)
-        # Strip medium information from query, Things like "CD1" and "disk 1"
-        # can also negate an otherwise positive result.
-        query = re.sub(r"(?i)\b(CD|disc|vinyl)\s*\d+", "", query)
+        if self.config["filter_special_chars"].get(bool):
+            # Strip non-word characters from query. Things like "!" and "-" can
+            # cause a query to return no results, even if they match the artist or
+            # album title. Use `re.UNICODE` flag to avoid stripping non-english
+            # word characters.
+            query = re.sub(r"(?u)\W+", " ", query)
+            # Strip medium information from query, Things like "CD1" and "disk 1"
+            # can also negate an otherwise positive result.
+            query = re.sub(r"(?i)\b(CD|disc|vinyl)\s*\d+", "", query)
+
+        self._log.debug(
+            "Searching for query='{0}' with parameters: {1}",
+            query,
+            kwargs,
+        )
 
         try:
-            results = self.discogs_client.search(query, type="release", **kwargs)
+            results = self.discogs_client.search(
+                query, type="release", **kwargs
+            )
             results.per_page = self.config["search_limit"].as_number()
             releases = results.page(1)
+
+            self._log.debug(
+                "Found {0} result(s) for query '{1}'",
+                len(releases),
+                query,
+            )
+
         except CONNECTION_ERRORS:
             self._log.debug(
                 "Communication error while searching for {0!r}",
@@ -288,7 +410,10 @@ class DiscogsPlugin(MetadataSourcePlugin):
                 exc_info=True,
             )
             return []
-        return filter(None, map(self.get_album_info, releases))
+
+        # Convert filter result to list to ensure proper processing by beets
+        album_infos = list(filter(None, map(self.get_album_info, releases)))
+        return album_infos
 
     @cache
     def get_master_year(self, master_id: str) -> int | None:
